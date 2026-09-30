@@ -1,12 +1,26 @@
 import json
+import os
+import re
+import sys
 import threading
 import time
 import urllib.request
 import urllib.error
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 URL = "https://members.swtc.ca/api/v1/memberships/register"
-DEFAULT_TIME = "2026-10-01 08:00:00"
+CONFIG_FILE = "swtc_config.json"   # optional, lives next to the script/exe
+
+DEFAULTS = {
+    "membership_type_id": "5001",
+    "payment_method_id": "5",
+    "run_at": "2026-10-01 08:00:00",
+    "workers": "2",
+    "max_per_minute": "12",
+    "interval": "0.5",
+    "give_up_seconds": "300",
+}
 
 try:
     from zoneinfo import ZoneInfo
@@ -14,18 +28,56 @@ try:
 except Exception:
     ET = timezone(timedelta(hours=-4))  # EDT fallback (valid for Oct 1)
 
-go = threading.Event()      # set at the scheduled time
-stop = threading.Event()    # set on success / fatal error / timeout
+go = threading.Event()
+stop = threading.Event()
 print_lock = threading.Lock()
 result = {"status": None, "body": None}
 counter = {"n": 0}
 
 
-def ask(prompt, default=None):
-    text = f"{prompt}" + (f" [{default}]" if default else "") + ": "
-    return input(text).strip() or default
+# ---------- config / prompts ----------
+def load_config():
+    base = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+    path = os.path.join(base, CONFIG_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
+def ask(prompt, default=None, cast=str, required=False, secret=False):
+    """Blank input -> default. Re-asks on invalid input or blank required field."""
+    shown = None
+    if default not in (None, ""):
+        shown = (str(default)[:6] + "..." + str(default)[-4:]) if secret and len(str(default)) > 12 else str(default)
+    while True:
+        value = input(f"{prompt}" + (f" [{shown}]" if shown else "") + ": ").strip()
+        if not value:
+            if default in (None, ""):
+                if required:
+                    print("  This one is required.")
+                    continue
+                return None
+            value = str(default)
+        try:
+            return cast(value)
+        except Exception:
+            print("  Invalid value, try again.")
+
+
+def parse_ids(s):
+    ids = [int(x) for x in s.split(",") if x.strip()]
+    if not ids:
+        raise ValueError
+    return ids
+
+
+def parse_time(s):
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET)
+
+
+# ---------- helpers ----------
 def now_str():
     return datetime.now(ET).strftime("%H:%M:%S.%f")[:-3]
 
@@ -33,6 +85,37 @@ def now_str():
 def say(msg):
     with print_lock:
         print(msg, flush=True)
+
+
+class Limiter:
+    """Shared across workers: max N attempts per rolling minute + server-imposed cooldown."""
+
+    def __init__(self, max_per_min):
+        self.max = max_per_min
+        self.lock = threading.Lock()
+        self.times = deque()
+        self.cooldown_until = 0.0
+
+    def set_cooldown(self, seconds):
+        with self.lock:
+            self.cooldown_until = max(self.cooldown_until, time.time() + seconds)
+            self.times.clear()
+
+    def acquire(self):
+        while not stop.is_set():
+            with self.lock:
+                now = time.time()
+                if now < self.cooldown_until:
+                    wait = self.cooldown_until - now
+                else:
+                    while self.times and now - self.times[0] >= 60:
+                        self.times.popleft()
+                    if len(self.times) < self.max:
+                        self.times.append(now)
+                        return True
+                    wait = 60 - (now - self.times[0])
+            stop.wait(min(max(wait, 0.05), 1.0))
+        return False
 
 
 def send(token, payload, membership_type_id):
@@ -58,18 +141,20 @@ def send(token, payload, membership_type_id):
         return 0, str(e), None
 
 
-def worker(wid, token, payload, membership_type_id, interval):
+def worker(wid, token, payload, membership_type_id, interval, limiter):
     go.wait()
-    last_seen = None
+    last_sig = None
     while not stop.is_set():
+        if not limiter.acquire():
+            return
         status, body, retry_after = send(token, payload, membership_type_id)
         with print_lock:
             counter["n"] += 1
             n = counter["n"]
-        sig = (status, body[:200])
-        if sig != last_seen:  # only print when the response changes, to avoid flooding
+        sig = (status, re.sub(r"\d+", "#", body[:200]))  # ignore changing numbers
+        if sig != last_sig:
             say(f"[{now_str()}] #{n} worker {wid}: status {status} {body[:300]}")
-            last_seen = sig
+            last_sig = sig
 
         if 200 <= status < 300:
             with print_lock:
@@ -85,14 +170,17 @@ def worker(wid, token, payload, membership_type_id, interval):
             say("409 conflict: probably already registered. Stopping.")
             stop.set()
             return
-
-        delay = interval
-        if status == 429:  # server asks us to slow down
+        if status == 429:
+            m = re.search(r"wait (\d+) second", body)
             try:
-                delay = max(float(retry_after), interval)
+                secs = float(m.group(1)) if m else float(retry_after)
             except (TypeError, ValueError):
-                delay = 2.0
-        stop.wait(delay)
+                secs = 60.0
+            say(f"[{now_str()}] Rate limited. All workers pausing {secs + 1:.0f}s.")
+            limiter.set_cooldown(secs + 1)
+            continue
+
+        stop.wait(interval)
 
 
 def wait_until(target):
@@ -111,17 +199,20 @@ def wait_until(target):
 
 
 def main():
-    print("SWTC membership register (scheduled, parallel retry)\n")
-    token = ask("gameupper_token (cookie value from your browser)")
-    membership_type_id = int(ask("membership_type_id", "5001"))
-    payment_method_id = int(ask("payment_method_id", "5"))
-    ids = ask("registrant_ids (comma separated)")
-    registrant_ids = [int(x) for x in ids.split(",") if x.strip()]
-    when = ask("Run at (Eastern Time, YYYY-MM-DD HH:MM:SS)", DEFAULT_TIME)
-    workers = min(int(ask("Parallel workers (max 5)", "3")), 5)
-    interval = max(float(ask("Seconds between retries per worker (min 0.2)", "0.5")), 0.2)
-    max_seconds = int(ask("Give up after how many seconds", "120"))
-    target = datetime.strptime(when, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET)
+    cfg = load_config()
+    print("SWTC membership register (scheduled)")
+    print("Press Enter on any question to accept the value in [brackets].\n")
+
+    token = ask("gameupper_token", cfg.get("token") or os.environ.get("SWTC_TOKEN"), required=True, secret=True)
+    membership_type_id = ask("membership_type_id", cfg.get("membership_type_id", DEFAULTS["membership_type_id"]), int)
+    payment_method_id = ask("payment_method_id", cfg.get("payment_method_id", DEFAULTS["payment_method_id"]), int)
+    registrant_ids = ask("registrant_ids (comma separated)", cfg.get("registrant_ids"), parse_ids, required=True)
+    target = ask("Run at (Eastern Time, YYYY-MM-DD HH:MM:SS)", cfg.get("run_at", DEFAULTS["run_at"]), parse_time)
+    workers = min(ask("Parallel workers (max 5)", cfg.get("workers", DEFAULTS["workers"]), int), 5)
+    max_per_min = min(ask("Max attempts per minute, all workers (server limit is ~20)",
+                          cfg.get("max_per_minute", DEFAULTS["max_per_minute"]), int), 18)
+    interval = max(ask("Seconds between retries per worker (min 0.2)", cfg.get("interval", DEFAULTS["interval"]), float), 0.2)
+    max_seconds = ask("Give up after how many seconds", cfg.get("give_up_seconds", DEFAULTS["give_up_seconds"]), int)
 
     payload = {
         "membership_type_id": membership_type_id,
@@ -130,15 +221,16 @@ def main():
         "agreement_accepted": True,
     }
 
+    limiter = Limiter(max_per_min)
     threads = [
-        threading.Thread(target=worker, args=(i + 1, token, payload, membership_type_id, interval), daemon=True)
+        threading.Thread(target=worker, args=(i + 1, token, payload, membership_type_id, interval, limiter), daemon=True)
         for i in range(workers)
     ]
     for t in threads:
         t.start()
 
-    print(f"\nWill fire at {target.strftime('%Y-%m-%d %H:%M:%S %Z')} with {workers} workers "
-          f"(~{workers / interval:.0f} req/s max), giving up after {max_seconds}s.")
+    print(f"\nWill fire at {target.strftime('%Y-%m-%d %H:%M:%S %Z')} with {workers} workers, "
+          f"max {max_per_min} attempts/min, giving up after {max_seconds}s.")
     print("Keep this window open and the PC awake. Ctrl+C to abort.\n")
 
     try:
